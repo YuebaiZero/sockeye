@@ -12,7 +12,8 @@
 # permissions and limitations under the License.
 
 import logging
-from typing import Optional, Union, Tuple
+from abc import abstractmethod
+from typing import Optional, Union, Tuple, List
 from functools import lru_cache
 
 import mxnet as mx
@@ -288,31 +289,6 @@ def combine_heads(F, x: mx.sym.Symbol, depth_per_head: int, heads: int) -> mx.sy
     return F.reshape(x, shape=(-1, 0, depth_per_head * heads))
 
 
-def broadcast_to_heads(F, x: mx.sym.Symbol, num_heads: int, ndim: int, fold_heads: bool = True) -> mx.sym.Symbol:
-    """
-    Broadcasts batch-major input of shape (batch, d1 ... dn-1) to (batch*heads, d1 ... dn-1).
-
-    :param x: Batch-major input. Shape: (batch, d1 ... dn-1).
-    :param num_heads: Number of heads.
-    :param ndim: Number of dimensions in x.
-    :param fold_heads: Whether to fold heads dimension into batch dimension.
-    :return: Tensor with each sample repeated heads-many times.
-             Shape: (batch * heads, d1 ... dn-1) if fold_heads == True, (batch, heads, d1 ... dn-1) else.
-    """
-    dims = [0] * (ndim - 1)
-    # x: (batch, 1)
-    x = F.expand_dims(x, axis=1)
-    # x: (batch, heads, dims...)
-    #x = F.broadcast_to(x, shape=[0, num_heads] + dims)
-    x = F.repeat(x, repeats=num_heads, axis=1)
-    if fold_heads:
-        # (batch * heads, dims...)
-        return F.reshape(x, shape=[-3] + dims)
-    else:
-        # x: (batch, heads, dims...)
-        return x
-
-
 class DotAttentionCell(mx.gluon.HybridBlock):
 
     def __init__(self, dropout: float = 0.0, prefix: str = '') -> None:
@@ -328,23 +304,15 @@ class DotAttentionCell(mx.gluon.HybridBlock):
         # (n, lq, lk)
         logits = F.batch_dot(lhs=queries, rhs=keys, transpose_b=True)
 
-        # TODO(fhieber): consider softmax with length argument once available.
-        # TODO(fhieber: Also see https://github.com/dmlc/gluon-nlp/pull/910
-        if lengths is not None:
-            # mask lk dimension
-            # (lk, n, lq)
-            logits = F.transpose(logits, axes=(2, 0, 1))
-            logits = F.SequenceMask(logits,
-                                    use_sequence_length=True,
-                                    sequence_length=lengths,
-                                    value=-C.LARGE_VALUES[self._dtype])
-            # (n, lq, lk)
-            logits = F.transpose(data=logits, axes=(1, 2, 0))
-
         if bias is not None:
             logits = F.broadcast_add(logits, bias)
 
-        probs = F.softmax(logits, axis=-1)
+        if lengths is not None:
+            lengths = F.broadcast_like(F.expand_dims(lengths, axis=1), logits, lhs_axes=(1,), rhs_axes=(1,))
+            probs = F.softmax(logits, axis=-1, length=F.cast(lengths, dtype='int32'), use_length=True)
+        else:
+            probs = F.softmax(logits, axis=-1)
+
         probs = F.Dropout(probs, p=self.dropout) if self.dropout > 0.0 else probs
 
         # (n, lq, lk) x (n, lk, dv) -> (n, lq, dv)
@@ -394,7 +362,7 @@ class MultiHeadAttentionBase(mx.gluon.HybridBlock):
         :param queries: Query tensor. Shape: (batch_size, heads, query_max_length, depth_per_head).
         :param keys: Keys. Shape: (batch_size, heads, memory_max_length, depth_per_head).
         :param values: Values. Shape: (batch_size, heads, memory_max_length, depth_per_head).
-        :param lengths: Optional lengths of keys. Shape: (batch_size,).
+        :param lengths: Optional lengths of keys. Shape: (batch_size*heads,).
         :param bias: Optional 3d bias.
         :return: Context vectors. Shape: (batch_size, query_max_length, output_depth).
         """
@@ -403,8 +371,6 @@ class MultiHeadAttentionBase(mx.gluon.HybridBlock):
         queries = F.reshape(queries, shape=(-3, -1, self.depth_per_head))
         keys = F.reshape(keys, shape=(-3, -1, self.depth_per_head))
         values = F.reshape(values, shape=(-3, -1, self.depth_per_head))
-        lengths = broadcast_to_heads(F, lengths, self.heads, ndim=1,
-                                     fold_heads=True) if lengths is not None else lengths
 
         # (batch*heads, query_max_length, depth_per_head)
         contexts = self.dot_att(queries, keys, values, lengths, bias)
@@ -418,7 +384,45 @@ class MultiHeadAttentionBase(mx.gluon.HybridBlock):
         return contexts
 
 
-class MultiHeadSelfAttention(MultiHeadAttentionBase):
+class AutoregressiveLayer(mx.gluon.HybridBlock):
+    @property
+    @abstractmethod
+    def prefix(self) -> str:
+        raise NotImplementedError
+
+    @property
+    @abstractmethod
+    def num_state_tensors(self) -> int:
+        """ Number of state tensors returned by the layer """
+        raise NotImplementedError
+
+    @property
+    @abstractmethod
+    def needs_mask(self) -> bool:
+        """ Whether the layer makes use of a mask tensor or not """
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_state_shape(self, batch_size) -> Tuple:
+        """
+        :param batch_size: current batch size
+        :return: dimensions of each output state (assuming all of them have the same shape)
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def hybrid_forward(self, F, inputs: mx.sym.Symbol, previous_states: mx.sym.Symbol, *args) -> Tuple:
+        """
+        :param F: ndarray or Symbol
+        :param inputs: layer input
+        :param previous_states: Symbol or list of Symbols
+        :param args: layer-specific arguments and/or arguments to be ignored
+        :return: layer output and new states
+        """
+        raise NotImplementedError
+
+
+class MultiHeadSelfAttention(MultiHeadAttentionBase, AutoregressiveLayer):
     """
     Multi-head self-attention. Independent linear projections of inputs serve as
     queries, keys, and values for the attention.
@@ -443,12 +447,34 @@ class MultiHeadSelfAttention(MultiHeadAttentionBase):
         with self.name_scope():
             self.ff_in = quantization.QuantizableDense(in_units=depth_att, units=depth_att * 3, flatten=False, use_bias=False, prefix='i2h_', dtype=dtype)
 
+    @property
+    def prefix(self) -> str:
+        return "att_self_"
+
+    @property
+    def num_state_tensors(self) -> int:
+        """ Number of state tensors returned by the layer """
+        return 2
+
+    @property
+    def needs_mask(self) -> bool:
+        """ Whether the layer makes use of a mask tensor or not """
+        return True
+
+    def get_state_shape(self, batch_size: int) -> Tuple:
+        """
+        :param batch_size: current batch size
+        :return: dimensions of each output state (assuming all of them have the same shape)
+        """
+        # shape: (batch, heads, length, depth_per_head)
+        return batch_size, self.heads, 1, self.depth_out // self.heads
+
     def hybrid_forward(self, F,
                        inputs: mx.sym.Symbol,
+                       previous_states: List[mx.sym.Symbol],
                        input_lengths: Optional[mx.sym.Symbol] = None,
                        bias: Optional[mx.sym.Symbol] = None,
-                       previous_keys: Optional[mx.sym.Symbol] = None,
-                       previous_values: Optional[mx.sym.Symbol] = None):  # mypy: ignore
+                       *args):  # mypy: ignore
         """
         Computes multi-head attention on a set of inputs, serving as queries, keys, and values.
         If sequence lengths are provided, they will be used to mask the attention scores.
@@ -459,8 +485,8 @@ class MultiHeadSelfAttention(MultiHeadAttentionBase):
         :param inputs: Input Data. Shape: (batch, max_length, input_depth).
         :param input_lengths: Optional lengths of inputs to mask attention scores. Shape: (batch, 1).
         :param bias: Optional 3d bias tensor to mask attention scores.
-        :param previous_keys: Optional previous input projections of keys. Shape: (batch, max_length+1, depth_att).
-        :param previous_values: Optional previous input projections of values. Shape: (batch, max_length+1, depth_att).
+        :param previous_states: Optional list with two Symbols - previous input's keys and values.
+                                Shape: 2 * (batch, max_length+1, depth_att).
         :return: Symbol of shape (batch, max_length, output_depth).
         """
         # combined: (batch, max_length, depth * 3)
@@ -478,6 +504,8 @@ class MultiHeadSelfAttention(MultiHeadAttentionBase):
         values = split_heads(F, values, self.depth_per_head, self.heads)
 
         updated_keys = keys
+
+        previous_keys, previous_values = previous_states
         if previous_keys is not None:
             updated_keys = F.concat(previous_keys, keys, dim=2)
             keys = _remove_first_step(F, updated_keys)
@@ -732,3 +760,128 @@ class PositionalEmbeddings(mx.gluon.HybridBlock):
             data = data * (self.num_embed ** 0.5)
 
         return F.broadcast_add(data, pos_embedding)
+
+
+class SSRU(AutoregressiveLayer):
+    """
+    Simpler Simple Recurrent Unit
+
+    Kim et al, "From Research to Production and Back: Ludicrously Fast Neural Machine Translation" WNGT 2019
+
+    Variant of an LSTM cell aimed at reducing computational dependency across time steps.
+    Formally described as:
+
+    (1) f[t] = sigmoid(W1[t] * x[t] + b[t])
+    (2) c[t] = f[t] . c[t-1] + (1 - f[t]) . W2[t] * x[t]
+    (3) h = ReLU(c[t])
+
+    where:
+        . represents elementwise multiplication;
+        x[t] is the input at time step t;
+        f[t] is the output of the forget gate at time step t;
+        c[t] is the cell state at time step t;
+        h is the output of the unit.
+
+    :param model_size: number of hidden units
+    :param inference_only: flag used to indicate execution at inference time
+    :param prefix: prefix prepended to the names of internal Symbol instances
+    :param dtype: data type
+    """
+    def __init__(self,
+                 model_size: int,
+                 inference_only: bool,
+                 prefix: str = C.SSRU_PREFIX,
+                 dtype: str = C.DTYPE_FP32) -> None:
+        super(SSRU, self).__init__(prefix=prefix)
+
+        self.model_size = model_size
+        self.inference_only = inference_only
+
+        self.cell_state_transform = self._inference_cell_state_transform \
+                                    if inference_only else self._training_cell_state_transform
+
+        with self.name_scope():
+            self.forget_gate = quantization.QuantizableDense(in_units=model_size,
+                                                             units=model_size,
+                                                             activation="sigmoid",
+                                                             flatten=False,
+                                                             prefix="forget_gate_",
+                                                             dtype=dtype)
+
+            self.linear = quantization.QuantizableDense(in_units=model_size,
+                                                        units=model_size,
+                                                        use_bias=False,
+                                                        flatten=False,
+                                                        prefix="linear_",
+                                                        dtype=dtype)
+
+    @property
+    def prefix(self) -> str:
+        return C.SSRU_PREFIX
+
+    @property
+    def num_state_tensors(self) -> int:
+        """ Number of state tensors returned by the layer """
+        return 1
+
+    @property
+    def needs_mask(self) -> bool:
+        """ Whether the layer makes use of a mask tensor or not """
+        return False
+
+    def get_state_shape(self, batch_size: int) -> Tuple:
+        """
+        :param batch_size: current batch size
+        :return: dimensions of each output state (assuming all of them have the same shape)
+        """
+        if self.inference_only:
+            return batch_size, 1, self.model_size
+        else:
+            return batch_size, self.model_size
+
+    @staticmethod
+    def _training_cell_state_transform(F, previous_cell_state, weighted_inputs, forget_rates) -> Tuple:
+        """Update SSRU cell at training time"""
+        def _time_step_update(step_input_and_forget_rate, previous_step_state) -> Tuple:
+            """
+            Recurrently update the SSRU cell state for one time step.
+
+            :param step_input_and_forget_rate: List = [step_input, forget_rate]
+            :param previous_step_state: cell state at (t-1)
+            :return: twice the current time step state. NOTE: The first instance will be stacked in the final
+            foreach output and the second will be the input to the next time_step_update iteration.
+            """
+            step_input, forget_rate = step_input_and_forget_rate  # each of shape (batch_size, model_size)
+            current_step_state = forget_rate * previous_step_state + step_input
+            return current_step_state, current_step_state
+
+        weighted_inputs = F.transpose(weighted_inputs, axes=(1, 0, 2))  # (max_length, batch, input_depth)
+        forget_rates = F.transpose(forget_rates, axes=(1, 0, 2))  # (max_length, batch, input_depth)
+
+        # (max_length, batch, input_depth), (batch, input_depth)
+        cell_state, last_step_state = F.contrib.foreach(_time_step_update,
+                                                        [weighted_inputs, forget_rates],
+                                                        previous_cell_state)
+
+        return F.transpose(cell_state, axes=(1, 0, 2)), last_step_state
+
+    @staticmethod
+    def _inference_cell_state_transform(F, previous_cell_state, weighted_inputs, forget_rates) -> Tuple:
+        """Update SSRU cell at inference time"""
+        new_step_state = forget_rates * previous_cell_state + weighted_inputs  # (batch, 1, input_depth)
+        return new_step_state, new_step_state
+
+    def hybrid_forward(self, F, inputs: mx.sym.Symbol, previous_states: mx.sym.Symbol, *args) -> Tuple:
+        """
+        :param F: ndarray or Symbol
+        :param inputs: input data. Shape: (batch, max_length, input_depth).
+        :param previous_states: previous cell states. Shape: (batch, max_length, input_depth)
+        :return: cell output and new cell states.  Both with shape (batch, max_length, input_depth).
+        """
+        forget_rates = self.forget_gate(inputs)
+        weighted_inputs = (1 - forget_rates) * self.linear(inputs)
+
+        cell_state, last_step_state = self.cell_state_transform(F, previous_states, weighted_inputs, forget_rates)
+
+        return F.relu(cell_state), last_step_state
+

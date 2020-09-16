@@ -12,10 +12,62 @@ Note that Sockeye has checks in place to not translate with an old model that wa
 Each version section may have have subsections for: _Added_, _Changed_, _Removed_, _Deprecated_, and _Fixed_.
 
 
-## [2.1.17]
+## [2.1.24]
 
 ### Fixed
+
  - Fix: Guard against null division for small batch sizes.
+
+## [2.1.23]
+
+### Changed
+
+- Updated to [MXNet 1.7.0](https://github.com/apache/incubator-mxnet/tree/1.7.0).
+- Re-introduced use of softmax with length parameter in DotAttentionCell (see PR #772).
+
+## [2.1.22]
+
+### Added
+
+- Re-introduced `--softmax-temperature` flag for `sockeye.score` and `sockeye.translate`.
+
+## [2.1.21]
+
+### Added
+
+- Added an optional ability to cache encoder outputs of model.
+
+## [2.1.20]
+
+### Fixed
+
+- Fixed a bug where the training state object was saved to disk before training metrics were added to it, leading to an inconsistency between the training state object and the metrics file (see #859).
+
+## [2.1.19]
+
+### Fixed
+
+- When loading a shard in Horovod mode, there is now a check that each non-empty bucket contains enough sentences to cover each worker's slice. If not, the bucket's sentences are replicated to guarantee coverage.
+
+## [2.1.18]
+
+### Fixed
+
+- Fixed a bug where sampling translation fails because an array is created in the wrong context.
+
+## [2.1.17]
+
+### Added
+
+- Added `layers.SSRU`, which implements a Simpler Simple Recurrent Unit as described in
+Kim et al, "From Research to Production and Back: Ludicrously Fast Neural Machine Translation" WNGT 2019.
+
+- Added `ssru_transformer` option to `--decoder`, which enables the usage of SSRUs as a replacement for the decoder-side self-attention layers.
+
+### Changed
+
+- Reduced the number of arguments for `MultiHeadSelfAttention.hybrid_forward()`.
+ `previous_keys` and `previous_values` should now be input together as `previous_states`, a list containing two symbols.
 
 ## [2.1.16]
 
